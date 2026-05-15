@@ -16,9 +16,11 @@ import uuid
 import websockets
 from dotenv import load_dotenv
 
+# 先 load .env,再 import handlers —— 这样 handlers / lib 里如果有 import 时读 env 的代码也不会踩坑
+load_dotenv()
+
 from handlers import HANDLERS, handle_unknown
 
-load_dotenv()
 BOT_ID = os.getenv("WECOM_BOT_ID")
 SECRET = os.getenv("WECOM_BOT_SECRET")
 WS_URL = "wss://openws.work.weixin.qq.com"

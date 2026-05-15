@@ -2,3 +2,9 @@ websockets>=12.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
 pycryptodome>=3.20.0
+playwright>=1.40.0
+python-docx>=1.1.0
+# greenlet 3.2 起 PyPI 上没有 Python 3.9 + Windows 的预编译 wheel,
+# 没装 MSVC 的机器会编译失败。pin 到 3.1.1 这个最后一个有 win-amd64-cp39 wheel 的版本。
+# 升级 Python 到 3.11+ 后可以放开此约束。
+greenlet==3.1.1

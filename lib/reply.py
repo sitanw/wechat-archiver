@@ -5,6 +5,8 @@
 - dump_body 是主路径,**绝不抛异常**——handler 的核心目标是"留下样本",落盘失败也只 warn
 - reply_markdown 也是 best-effort——response_url 缺失 / httpx 失败都只 warn,不影响 dump
 """
+from __future__ import annotations  # 让所有类型注解延迟求值,兼容 Python 3.9 下的 X | None 写法
+
 import json
 import os
 import re

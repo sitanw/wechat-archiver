@@ -25,12 +25,14 @@
 - **file / image handler 含解密 + 落盘**:从 COS 下载密文 → AES-256-CBC + 宽容 PKCS#7 unpad → magic bytes 识别扩展名 → 落盘到 `ARCHIVE_DIR`(默认 `inbox/`),文件名 `{YYYYMMDD}_{HHMMSS}.{ext}`
 - **`ARCHIVE_DIR` 通过 `.env` 可配**,默认 `inbox/`,实测目标:`D:\VibeCodingProjects\2.1_Project_MeetingMinutes\data\02b_external_notes`
 
-### 🔜 当前推进中
-- **公众号链接抓取 → DOCX**:复用用户 AceCamp scraper 的 Playwright 套路(异步、反检测、DOCX 输出),针对 `mp.weixin.qq.com` URL 抓正文 + 图片,落盘成 DOCX 喂下游
+### ✅ 最近完成
+- **公众号链接抓取 → DOCX**:async Playwright 抓 `mp.weixin.qq.com` 文章正文 → DOCX 落盘。默认不带图(`INCLUDE_IMAGES=true` 可开),元信息含公众号名 / 发布时间 / 原文 URL
+- **长文本笔记落盘**:无 URL 的纯文本超过 `NOTE_MIN_LENGTH`(默认 200 字符)自动落 DOCX
+- **Tag 配对**:任何归档落盘后 `TAG_WINDOW_SECONDS`(默认 5 分钟)内发的短文字自动追加到文件名,实现"文件 + 后续 tag → 完整命名"工作流
 
 ### 后续规划
 - 腾讯文档 / 有道云笔记 / 网盘类:**半自动或手动**(用户已表态可接受),不强求自动化
-- tag 解析器(给落盘文件加更友好的命名前缀,目前留空白由人工 / 下游补)
+- always-on 部署(VPS / 本机服务化)— 等用户验证 POC 价值后再做
 
 ## 凭证位置
 `.env` 文件(已配置,不进 git):
@@ -65,8 +67,18 @@
 - 链接类:**复制链接 → 粘贴发送**,以 `msgtype: text` 到达
 - 笔记 / 纪要类:**复制全文 → 粘贴发送**,长文本超过 NOTE_MIN_LENGTH 自动落盘为 DOCX
 
-### body 不带原始文件名
-file / image 消息 body 只有 `url` 和 `aeskey`,**没有 filename / mimetype / size**。微信客户端显示的"xxx.docx"在传给我们前就被剥掉。扩展名只能解密后看 magic bytes 自己判。
+### body 不带原始文件名(但 COS 响应头带)
+file / image 消息 body 只有 `url` 和 `aeskey`,**没有 filename / mimetype / size**。
+
+**但**:COS 下载响应里的 **HTTP `Content-Disposition` header 带了原始文件名**(2026-05-16 实测确认)。格式:
+```
+attachment; filename=2026-05-07_Acecamp_%E4%B8%93%E5%AE%B6...docx
+```
+注意是 **URL percent-encoded UTF-8**(`%XX`),且**空格会被编码成 `+`**(application/x-www-form-urlencoded 风格,**不是** RFC 5987 的 `filename*=UTF-8''xxx` 格式)。
+
+所以 `urllib.parse.unquote_plus(value, encoding="utf-8")` 同时处理两种编码,完美还原中文文件名。
+
+实现:`lib/downloader.py::_extract_filename_from_disposition`,提取后作为 auto_title 拼到 `{date}_{time}_{original_stem}.{ext}`。下游 tag handler 重命名时若用户没打 title,fallback 链自然用上原文件名。
 
 ### aeskey 缺 padding
 `aeskey` 是 base64 但**只有 43 字符**(标准 base64 编码 32 字节内容应该 44 字符含 1 个 `=`)。`base64.b64decode` 严格会报 "Incorrect padding"。修法:`aeskey + "=" * (-len(aeskey) % 4)` 自己补齐。
@@ -107,18 +119,54 @@ file / image 的 COS URL 里 `q-sign-time` 显示有效期 5 分钟。handler �
 
 **长期目标**(待 tag 解析器实现):`{date}_{company}_{source}_{type}_[{period}]_{topic}.{ext}`,由"file + 紧随的 tag text 配对"机制驱动
 
-### Tag 协议(未实现)
-转发文件 / 链接之后立刻发一句 tag,词序不限,例如:
-> "Q1 26 公司交流 Callback 阿里巴巴"
+### Tag 协议(已实现结构化版)
+任何归档(file / image / 公众号 DOCX / 长文本笔记 DOCX)落盘后,该用户在 `TAG_WINDOW_SECONDS`(默认 300 秒)内发的一条**含 type 关键词**的短文字,会被解析成 4 个字段(type / source / company / title),并以 `{date}_{type}_{company}[_{source}]_{title}.{ext}` 格式重命名该归档。
 
-未来 tag 解析器规则:
-- **company**:**MVP 阶段直接取用户输入的公司词**,不做归一化(白名单留作后续优化,等真出现"阿里巴巴 / BABA / 阿里"被聚合到不同 company 字段"的痛点时再补)
-- **type**:9 类之一
-- **period**(可选):格式 NQYY 或 FYYY,如 `26Q1` / `FY25`
-- 其余自由词进 topic
+**解析规则**(`lib/tag_parser.py`):
+- **type**(必需,白名单 + 最长匹配 + 大小写不敏感):专家访谈 / 付费专家 / 公司交流 / 卖方汇报 / 媒体新闻 / Alpine周度汇报 / 同行交流 / 新闻 / 传闻 / Alpine
+  - "Alpine周度汇报" 优先于 "Alpine",防止短前缀误吞
+- **source**(可选,白名单):专家网络(Acecamp / Thirdbridge / AlphaEngine / 公众号)+ 卖方(Citi / UBS / GS / MS / JPM / CICC / CLSA / Macquarie / Barclays / BofA / HSBC / Nomura / Jefferies / Deutsche / Bernstein / Daiwa)
+  - 公众号抓取的 DOCX 默认带 `source_hint="公众号"`,用户 tag 没指定 source 时自动填上
+- **company**(必需,启发式):剩余 token 里第一个"像公司名"的——≥2 个汉字 或 ≥3 个全大写字母
+- **title**(可选):再剩余的 token 用 `_` 连接;为空则 fallback 到老文件名里的 auto_title(如公众号文章标题、笔记第一行),再 fallback 到 HHMMSS
 
-### NOTE_MIN_LENGTH 阈值设计意图
-默认 200 字符。比这个低的纯文本会有一定概率是"tag 文字"(比如"Q1 26 callback 阿里巴巴")而不是真正的笔记内容——MVP 阶段没有 tag parser 配对机制,所以阈值放高一点,避免把 tag 文字误当独立笔记落盘。**等 tag parser 上线后,这类短文字会被识别为 file/链接的 tag,**这时候阈值可以放低甚至取消。
+**示例**:
+
+| 原文件 | 用户 tag | 重命名后 |
+|---|---|---|
+| `20260516_143020.pdf` | `公司交流 阿里巴巴` | `20260516_公司交流_阿里巴巴_143020.pdf` |
+| `20260516_143020.pdf` | `卖方汇报 阿里 GS 创新药点评` | `20260516_卖方汇报_阿里_GS_创新药点评.pdf` |
+| `20260516_143020_阿里健康2HFY26_callback.docx`(公众号) | `新闻 阿里` | `20260516_新闻_阿里_公众号_阿里健康2HFY26_callback.docx` |
+| `20260516_143020.pdf` | `Alpine 阿里 Q1` | `20260516_Alpine_阿里_Q1.pdf` |
+| `20260516_143020.pdf` | `Alpine周度汇报 阿里 2026W20` | `20260516_Alpine周度汇报_阿里_2026W20.pdf` |
+
+**触发条件**:
+- 无 URL
+- 文本含 type 白名单关键词(`has_type_keyword`)→ **才视为 tag 意图**;否则当普通文本处理(避免闲聊被误消费)
+- 文本长度 ∈ [3, NOTE_MIN_LENGTH-1)(默认 3~199 字符)
+- 该 userid 在窗口内有未消费的 pending 归档(队列非空)
+
+**校验失败**:
+- 含 type 关键词但 parse 后 type 或 company 为空 → 不重命名,回执提示缺什么
+- 含 type 关键词但无 pending 归档 → 提示"请先发文件再发 tag"
+
+**并发处理**(FIFO 队列):
+- pending 从单值 dict 改为 deque,**多个文件未 tag 时按发文件顺序排队**
+- 用户发的 tag 消费**队列头(最老的)**:文件 A → 文件 B → tag X → tag Y 会得到 (X→A, Y→B)
+- 单 userid 队列上限 20,防异常情况下内存失控
+
+**状态**:`lib/pending_tag.py` 内存 dict[userid → deque],进程重启丢失(可接受,窗口本来就 5 分钟)。
+
+**未来可补**(看痛点而定):
+- 公司白名单 / 别名归一化(出现"阿里 / BABA / 阿里巴巴"被算作三个 company 的痛点时)
+- 引用机制(Phase 3):用户长按消息→引用→加 tag,精准选定历史文件 + 修正错 tag。需先实测企微 quote 字段格式
+- 持久化(sqlite),避免进程重启丢失 pending
+
+### NOTE_MIN_LENGTH 与 TAG_MIN_CHARS 的阈值关系
+- 文本长度 < 3:回执"已识别为 文本消息",忽略(避免"ok"被误判为 tag)
+- 3 ≤ 长度 < NOTE_MIN_LENGTH(默认 200) **且有 pending**:走 tag 重命名
+- 3 ≤ 长度 < NOTE_MIN_LENGTH **无 pending**:回执"已识别为 文本消息"
+- 长度 ≥ NOTE_MIN_LENGTH:落盘为长文本笔记 DOCX,然后**自己也登记 pending**,允许再发 tag 重命名
 
 ### 内容类型(9 类,未实现)
 现有 6 类(invest-kb tags_dict.yml 复用) + 3 类新增:
@@ -135,16 +183,16 @@ file / image 的 COS URL 里 `q-sign-time` 显示有效期 5 分钟。handler �
 
 | 输入 | msgtype | 当前处理 | 状态 |
 |---|---|---|---|
-| 短文字(<200 字) | text | 落盘 sample + 回执"文本消息" | ✅ |
-| 长文字(≥NOTE_MIN_LENGTH,默认 200) | text | 第一行作标题 → 落盘成 DOCX 到 ARCHIVE_DIR | ✅ |
-| 含 URL 的文字(公众号) | text | Playwright 抓正文 → DOCX 落到 ARCHIVE_DIR(默认不带图,INCLUDE_IMAGES 可开) | ✅ |
-| 含 URL 的文字(有道云) | text | URL 检测 → 回执"暂仅记录,待人工补抓" | ✅(stub) |
-| 含 URL 的文字(腾讯文档 / 微信文档) | text | 同上 | ✅(stub) |
-| 含 URL 的文字(普通网页) | text | 同上 | ✅(stub) |
-| 图片 | image | 下载 + AES 解密 + magic bytes → 落盘 .jpg/.png/.webp/.gif | ✅ |
-| 文件(PDF / Word) | file | 下载 + AES 解密 + magic bytes → 落盘 .pdf/.docx/.xlsx/.pptx 等 | ✅ |
-| 富 share 卡片(公众号 / 腾讯文档 / 笔记 等转发) | — | **平台拦截,根本到不了** | ❌(无解,需用户复制内容/链接为 text) |
-| 语音 / 视频 / 位置等 | voice/video/... | 落盘样本 + handle_unknown 兜底 | ⚙️(待验证哪些 msgtype 会到) |
+| 极短文字(<3 字符) | text | 落盘 sample + 回执"文本消息" | ✅ |
+| 短文字(3..199 字符,**有 pending 归档**) | text | **作为 tag 重命名 pending 文件** | ✅ |
+| 短文字(3..199 字符,无 pending) | text | 回执"文本消息" | ✅ |
+| 长文字(≥NOTE_MIN_LENGTH) | text | 落盘 DOCX + 登记 pending(等下一条 tag) | ✅ |
+| 含 URL(公众号) | text | Playwright 抓 → DOCX + 登记 pending | ✅ |
+| 含 URL(有道云 / 腾讯文档 / 网页) | text | 仅回执,待手动 | ✅(stub) |
+| 图片 | image | 解密 + 落盘 + 登记 pending | ✅ |
+| 文件(PDF / Word / 等) | file | 解密 + 落盘 + 登记 pending | ✅ |
+| 富 share 卡片(公众号 / 笔记 / 文档转发) | — | **平台拦截,根本到不了** | ❌(无解,需复制内容/链接) |
+| 语音 / 视频 / 位置等 | voice/video/... | dump + handle_unknown 兜底 | ⚙️(待验证) |
 
 ## 运行环境
 - 开发 / POC 阶段:**本地 Windows 笔记本**,白天工作时段开机即可
@@ -173,7 +221,11 @@ wechat-archiver/
 │   ├── url_detect.py             # find_url / classify_url / extract_title
 │   ├── aes.py                    # AES-256-CBC + 宽容 PKCS#7 unpad
 │   ├── filetype.py               # magic bytes → 扩展名
-│   └── downloader.py             # download → decrypt → save 一站式
+│   ├── downloader.py             # download → decrypt → save 一站式
+│   ├── wechat_mp_fetcher.py      # Playwright 抓公众号 → DOCX
+│   ├── text_note_saver.py        # 长文本 → DOCX
+│   ├── pending_tag.py            # userid → FIFO 队列,等待 tag 重命名
+│   └── tag_parser.py             # 白名单 + 启发式解析 tag → 结构化字段
 ├── samples/                      # 运行时的消息 body JSON,git ignored
 └── inbox/                        # ARCHIVE_DIR 未设时的 fallback,git ignored
 ```

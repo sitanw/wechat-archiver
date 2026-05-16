@@ -81,8 +81,14 @@ def save_as_docx(content: str, body: dict) -> tuple[Path, int, str]:
     archive_dir = get_archive_dir()
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = _sanitize_title(title)
+    # 如果第一行(title)是日期开头(如笔记开头写 "2026-05-15 调研记录"),
+    # 用那个日期作 prefix,strip 出 title 主体
+    from lib.tag_parser import extract_leading_date
+    embedded_date, title_body = extract_leading_date(title or "")
+    date_str = embedded_date or _dt.datetime.now().strftime("%Y-%m-%d")
+    time_str = _dt.datetime.now().strftime("%H%M%S")
+    ts = f"{date_str}_{time_str}"
+    safe = _sanitize_title(title_body)
     filename = f"{ts}_{safe}.docx" if safe else f"{ts}.docx"
     path = archive_dir / filename
 

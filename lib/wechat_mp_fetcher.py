@@ -119,8 +119,16 @@ def _sanitize_title(title: str, max_len: int = 60) -> str:
 
 
 def _build_filename(title: str) -> str:
-    """{YYYYMMDD}_{HHMMSS}_{title}.docx;无标题则只保留时间戳"""
-    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    """
+    {date}_{HHMMSS}_{title}.docx;无标题则只保留 {date}_{HHMMSS}。
+    若 title 开头是日期(罕见,公众号文章标题通常不带),用它作 prefix,strip 出 title。
+    """
+    from lib.tag_parser import extract_leading_date
+
+    embedded_date, title = extract_leading_date(title or "")
+    date_str = embedded_date or _dt.datetime.now().strftime("%Y-%m-%d")
+    time_str = _dt.datetime.now().strftime("%H%M%S")
+    ts = f"{date_str}_{time_str}"
     safe = _sanitize_title(title)
     return f"{ts}_{safe}.docx" if safe else f"{ts}.docx"
 

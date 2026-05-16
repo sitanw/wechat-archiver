@@ -157,10 +157,39 @@ file / image 的 COS URL 里 `q-sign-time` 显示有效期 5 分钟。handler �
 
 **状态**:`lib/pending_tag.py` 内存 dict[userid → deque],进程重启丢失(可接受,窗口本来就 5 分钟)。
 
+### 引用模式(Phase 3,已实现)
+用户在企微里**长按消息 → 引用 → 加一句 tag** 发送时,企微会在 body 里带 `quote` 字段(实测确认):
+
+```json
+"quote": {
+    "msgtype": "text",          // 或 "markdown"
+    "text":     {"content": "..."},
+    // 或 "markdown": {"content": "..."}
+}
+```
+
+注意:**quote 只带内容,不带原消息 msgid**。所以无法用 msgid 直接定位,只能从 quote.content 里挖文件名。
+
+**实现**(`handlers/text.py::_handle_quoted_tag`):
+1. 用户引用 bot 之前的回执(里面有 backtick-wrapped 文件名,如 `` `20260516_143020.pdf` ``)
+2. 提取最后一个文件名匹配(rename 回执里"新名"在后,这是当前最新状态)
+3. 在 ARCHIVE_DIR 找该文件,存在则**直接 rename(不走 pending 队列)**
+4. 提取不到 → fall through 走常规 pending 流程
+
+**主要用途**:
+- **修正错 tag**:bot 之前给 X 打了 wrong tag → 用户引用那条回执 + 重发正确 tag → 文件被改正
+- **给已过期 pending 加 tag**:文件保存超过 5 分钟,pending 已清 → 用户引用 bot 当时的"已保存"回执 + 发 tag → 仍能 rename
+- **跨越 pending 队列指定文件**:有多个未 tag 文件时,精准 tag 中间某一个
+
+**限制**:
+- 只能引用 **bot 的回执**(因为只有那里有 backtick 包裹的文件名)
+- 引用用户自己的文件 / URL 消息 → quote 里没有可解析的文件名,fall through 走常规流程
+- 引用模式不消费 pending 队列(已落盘文件直接定位,不影响其他未 tag 文件)
+
 **未来可补**(看痛点而定):
 - 公司白名单 / 别名归一化(出现"阿里 / BABA / 阿里巴巴"被算作三个 company 的痛点时)
-- 引用机制(Phase 3):用户长按消息→引用→加 tag,精准选定历史文件 + 修正错 tag。需先实测企微 quote 字段格式
-- 持久化(sqlite),避免进程重启丢失 pending
+- 持久化 pending(sqlite),避免进程重启丢失
+- 引用 URL 消息 → 通过 URL 反查文件(需建持久 `URL → file_path` 映射)
 
 ### NOTE_MIN_LENGTH 与 TAG_MIN_CHARS 的阈值关系
 - 文本长度 < 3:回执"已识别为 文本消息",忽略(避免"ok"被误判为 tag)
@@ -185,6 +214,7 @@ file / image 的 COS URL 里 `q-sign-time` 显示有效期 5 分钟。handler �
 |---|---|---|---|
 | 极短文字(<3 字符) | text | 落盘 sample + 回执"文本消息" | ✅ |
 | 短文字(3..199 字符,**有 pending 归档**) | text | **作为 tag 重命名 pending 文件** | ✅ |
+| 短文字 + **引用 bot 回执** | text + quote | **引用模式:从 quote 抠出文件名直接 rename**(不消费 pending) | ✅ |
 | 短文字(3..199 字符,无 pending) | text | 回执"文本消息" | ✅ |
 | 长文字(≥NOTE_MIN_LENGTH) | text | 落盘 DOCX + 登记 pending(等下一条 tag) | ✅ |
 | 含 URL(公众号) | text | Playwright 抓 → DOCX + 登记 pending | ✅ |

@@ -109,11 +109,19 @@ def _sanitize_stem(name: str) -> str:
 # ───────────────────────────────────────────────
 def _build_filename(ext: str, title: str = "") -> str:
     """
-    {YYYYMMDD}_{HHMMSS}[_{title}].{ext}
+    {date}_{HHMMSS}[_{title_clean}].{ext}
 
-    title 可选;给定时拼到时间戳后,作为后续 tag handler 解析的 auto_title。
+    - 如果 title 以日期开头(原文件名带日期,如 "2026-05-07_Acecamp_xxx"),
+      使用这个日期作为 prefix,title 用剩余部分(避免双日期)
+    - 否则用今天的日期
     """
-    base = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 延迟 import 避免循环
+    from lib.tag_parser import extract_leading_date
+
+    embedded_date, title = (None, title) if not title else extract_leading_date(title)
+    date_str = embedded_date or _dt.datetime.now().strftime("%Y-%m-%d")
+    time_str = _dt.datetime.now().strftime("%H%M%S")
+    base = f"{date_str}_{time_str}"
     if title:
         return f"{base}_{title}.{ext}"
     return f"{base}.{ext}"

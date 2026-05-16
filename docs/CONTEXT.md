@@ -109,6 +109,33 @@ file / image 的 COS URL 里 `q-sign-time` 显示有效期 5 分钟。handler �
 - 离线消息会丢——本机睡眠 / VPN 抽风期间的消息**没有补发**
 - 代理环境下 wss 可能挂,需在代理软件里把 `work.weixin.qq.com` 走直连
 
+### Clash / mihomo fake-ip DNS 劫持的坑(实测踩过)
+Clash Verge / mihomo 默认开启 **fake-ip 模式**(把所有域名 DNS 返回 `198.18.x.x` 假 IP,然后 TUN 拦截转发)。这套机制对 **HTTP/HTTPS 短连接没问题**,但对**长连接 + WSS** 会让 TLS 握手莫名 `ConnectionResetError`,即便 Clash 已切到规则模式 + qq.com 命中 DIRECT。
+
+**症状**:`Test-NetConnection openws.work.weixin.qq.com -Port 443` 返回的 `RemoteAddress` 是 `198.18.0.x`,`InterfaceAlias=Meta`(Clash 虚拟网卡)。
+
+**解药**:覆写配置里加 `dns.fake-ip-filter`,把这几个域名排除 fake-ip,让 Clash 返回真实 IP,Python TCP 直连。
+
+```yaml
+# Clash Verge → 全局扩展覆写配置
+mode: rule
+
+prepend-rules:
+  - DOMAIN-SUFFIX,work.weixin.qq.com,DIRECT
+  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+  - DOMAIN-SUFFIX,myqcloud.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+
+dns:
+  fake-ip-filter:
+    - '+.work.weixin.qq.com'
+    - '+.weixin.qq.com'
+    - '+.qq.com'
+    - '+.myqcloud.com'
+```
+
+**别只加 prepend-rules 不加 fake-ip-filter**——前者只让 Clash 知道"该 DIRECT",但 DNS 阶段域名仍被解析成假 IP,TLS 在那一步就挂了。两者都要加。
+
 ## 设计决策
 
 ### 文件落盘命名

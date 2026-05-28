@@ -24,6 +24,7 @@ from lib.pending_tag import (
 )
 from lib.reply import dump_body, reply_markdown
 from lib.tag_parser import (
+    INDUSTRY_WHITELIST,
     TYPE_WHITELIST,
     build_renamed_filename,
     has_type_keyword,
@@ -34,6 +35,10 @@ from lib.tag_parser import (
 from lib.text_note_saver import get_min_length, is_long_enough, save_as_docx
 from lib.url_detect import classify_url, extract_title, find_url, SOURCE_LABEL
 from lib.wechat_mp_fetcher import LinkFetchError, fetch_and_save_as_docx
+from lib.generic_web_fetcher import (
+    LinkFetchError as GenericLinkFetchError,
+    fetch_and_save_as_docx as generic_fetch_and_save,
+)
 
 
 # 常规 tag(非引用)文字最低字符数,避免"ok"/"好的"被错误消费
@@ -104,7 +109,12 @@ async def handle(body: dict) -> None:
         await _handle_wechat_mp(body, url, user_title_hint, label)
         return
 
-    # 其他类型:仅回执,等人工补抓
+    if source_type == "web_other":
+        await _handle_generic_web(body, url, user_title_hint, label)
+        return
+
+    # 其他类型(有道云 / 腾讯文档 / 微信文档 / 网盘):需要登录态,trafilatura 拿不到
+    # 暂仅回执,留待半自动 / 手动
     reply_lines = [f"✅ 已识别为 **链接 / {label}**"]
     if user_title_hint:
         reply_lines.append(f"标题: {user_title_hint}")
@@ -125,13 +135,18 @@ async def _handle_tag_attempt(body: dict, userid: str, tag_text: str) -> None:
     """
     parsed = parse_tag(tag_text)
 
-    # 1. 校验:type 和 company 都得有
+    # 1. 校验:type 必填 + (company OR industry) 任一
     if not is_valid_tag(parsed):
         missing = []
         if not parsed.get("type"):
-            missing.append(f"**type**(可选: {', '.join(TYPE_WHITELIST[:5])} 等共 {len(TYPE_WHITELIST)} 类)")
-        if not parsed.get("company"):
-            missing.append("**company**(需 ≥2 个汉字 或 ≥3 个全大写字母)")
+            missing.append(f"**type**(从: {', '.join(TYPE_WHITELIST[:5])} 等共 {len(TYPE_WHITELIST)} 类)")
+        if not parsed.get("company") and not parsed.get("industry"):
+            missing.append(
+                "**company 或 industry 任一**\n"
+                "  • company:≥2 汉字 / ≥3 字母(如 阿里巴巴、Minimax、BABA)\n"
+                "  • industry:行业白名单(如 AI、电商、新能源、医药 等共 "
+                f"{len(INDUSTRY_WHITELIST)} 项)"
+            )
         await reply_markdown(
             body,
             "⚠️ tag 不完整,未重命名文件\n\n"
@@ -189,10 +204,16 @@ async def _handle_tag_attempt(body: dict, userid: str, tag_text: str) -> None:
         f"新名: `{new_path.name}`",
     ]
     # 解析结果展示,让用户直观看到字段拆解
-    parts = [f"type={parsed['type']}", f"company={parsed['company']}"]
+    parts = [f"type={parsed['type']}"]
+    if parsed.get("company"):
+        parts.append(f"company={parsed['company']}")
+    if parsed.get("industry"):
+        parts.append(f"industry={parsed['industry']}")
     if parsed.get("source") or pending.source_hint:
         src = parsed.get("source") or pending.source_hint
         parts.append(f"source={src}")
+    if parsed.get("date"):
+        parts.append(f"date={parsed['date']}")
     if parsed.get("title"):
         parts.append(f"title={parsed['title']}")
     reply_lines.append("解析: " + ", ".join(parts))
@@ -317,38 +338,42 @@ async def _handle_quoted_tag(body: dict, tag_text: str, quote: dict) -> bool:
         # 但 company-only 路径还要确认有 company)
         has_any_update = any(
             (parsed.get(k) or "").strip() if isinstance(parsed.get(k), str) else parsed.get(k)
-            for k in ("type", "company", "source", "title", "date")
+            for k in ("type", "company", "industry", "source", "title", "date")
         )
         if not has_any_update:
             await reply_markdown(
                 body,
                 "⚠️ 引用模式:tag 解析后没有任何可用字段\n\n"
                 f"原文: `{tag_text}`\n\n"
-                f"想改某个字段就直接打它的值,例如 `腾讯`(改 company)、`2026-05-10`(改 date)、`公司交流`(改 type)。",
+                f"想改某个字段就直接打它的值,例如 `腾讯`(改 company)、"
+                f"`电商`(改 industry)、`2026-05-10`(改 date)、`公司交流`(改 type)。",
             )
             return True
         # Merge:parsed 字段优先,空则继承 structured(老的)
+        # 注:structured 是从老文件名 reverse-parse 出来的,没有 industry 字段(因为
+        # 文件名里 industry 要么占了 company 槽位,要么混在 title 里,无法区分)
         merged_parsed = {
-            "type":    parsed.get("type")    or structured["type"],
-            "company": parsed.get("company") or structured["company"],
-            "source":  parsed.get("source")  or structured["source"],
-            "title":   parsed.get("title")   or structured["title"],
-            "date":    parsed.get("date")    or structured["date"],
+            "type":     parsed.get("type")     or structured["type"],
+            "company":  parsed.get("company")  or structured["company"],
+            "industry": parsed.get("industry") or None,  # structured 没有 industry,无从继承
+            "source":   parsed.get("source")   or structured["source"],
+            "title":    parsed.get("title")    or structured["title"],
+            "date":     parsed.get("date")     or structured["date"],
         }
         new_name = build_renamed_filename(target_path, merged_parsed, source_hint=None)
         is_partial = True
     else:
-        # 引用 + 初次保存的非结构化文件 → 仍要求 type + company 完整
+        # 引用 + 初次保存的非结构化文件 → 仍要求完整 type + (company 或 industry)
         if not is_valid_tag(parsed):
             missing = []
             if not parsed.get("type"):
-                missing.append(f"**type**(可选: {', '.join(TYPE_WHITELIST[:5])} 等共 {len(TYPE_WHITELIST)} 类)")
-            if not parsed.get("company"):
-                missing.append("**company**(需 ≥2 个汉字 或 ≥3 个全大写字母)")
+                missing.append(f"**type**(从: {', '.join(TYPE_WHITELIST[:5])} 等共 {len(TYPE_WHITELIST)} 类)")
+            if not parsed.get("company") and not parsed.get("industry"):
+                missing.append("**company 或 industry 任一**(公司名 2+ 汉字 / 3+ 字母 或 行业白名单)")
             await reply_markdown(
                 body,
                 "⚠️ tag 不完整,未重命名文件(引用模式)\n\n"
-                f"目标: `{target_filename}`(还未 tag 过,需要完整 type + company)\n\n"
+                f"目标: `{target_filename}`(还未 tag 过,需要完整 type + company/industry)\n\n"
                 f"tag 原文: `{tag_text}`\n\n"
                 f"缺: {' / '.join(missing)}",
             )
@@ -390,7 +415,7 @@ async def _handle_quoted_tag(body: dict, tag_text: str, quote: dict) -> bool:
     ]
     # 解析显示:只展示 user 真正指定的字段(structured 继承的不重复列)
     parts = []
-    for key in ("type", "company", "source", "title", "date"):
+    for key in ("type", "company", "industry", "source", "date", "title"):
         v = parsed.get(key)
         if v:
             parts.append(f"{key}={v}")
@@ -431,6 +456,49 @@ async def _handle_wechat_mp(body: dict, url: str, user_title_hint: str | None, l
 
     window_min = get_window_seconds() // 60
     reply_lines = [f"✅ 已抓取并保存 **公众号文章**"]
+    if fetched_title:
+        reply_lines.append(f"标题: {fetched_title}")
+    elif user_title_hint:
+        reply_lines.append(f"标题: {user_title_hint}")
+    reply_lines.append(f"文件: `{path.name}` ({humanize_size(size)})")
+    reply_lines.append(f"💡 {window_min} 分钟内发 tag(含 type 关键词)可重命名")
+    await reply_markdown(body, "\n\n".join(reply_lines))
+
+
+# ────────────────────────────────────────────────────────────
+#  通用网页抓取(财经新闻 / 博客 / Substack 等)
+# ────────────────────────────────────────────────────────────
+async def _handle_generic_web(body: dict, url: str, user_title_hint: str | None, label: str) -> None:
+    """
+    通用网页(web_other):trafilatura + Playwright 抓正文 → DOCX 落盘。
+    适配中文财经新闻类站点(华尔街见闻 / 36氪 / 财联社 / 雪球 / 虎嗅 / 新浪财经 等)。
+    """
+    print(f"[text handler / web_other] 开始抓取 {url} ...")
+
+    try:
+        path, size, fetched_title = await generic_fetch_and_save(url, body)
+    except GenericLinkFetchError as e:
+        print(f"[text handler / web_other] 抓取失败: {e}")
+        await reply_markdown(
+            body,
+            f"❌ 网页抓取失败\n\n"
+            f"URL: {url}\n\n"
+            f"原因: `{e}`\n\n"
+            f"该站点可能需要登录 / 用 SPA 重渲染 / 反爬较强,可手动保存 PDF。",
+        )
+        return
+    except Exception as e:
+        print(f"[text handler / web_other] 未预期异常: {type(e).__name__}: {e}")
+        await reply_markdown(body, f"❌ 网页抓取失败\n\n`{type(e).__name__}: {e}`")
+        return
+
+    # 落盘成功:登记 pending(没固定 source_hint,因为网页源很杂)
+    userid = (body.get("from") or {}).get("userid", "")
+    register_pending(userid, path)
+    print(f"[text handler / web_other] 已保存 {path} ({size} bytes), pending tag for userid={userid}")
+
+    window_min = get_window_seconds() // 60
+    reply_lines = [f"✅ 已抓取并保存 **网页文章**"]
     if fetched_title:
         reply_lines.append(f"标题: {fetched_title}")
     elif user_title_hint:

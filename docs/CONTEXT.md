@@ -147,25 +147,40 @@ dns:
 **长期目标**(待 tag 解析器实现):`{date}_{company}_{source}_{type}_[{period}]_{topic}.{ext}`,由"file + 紧随的 tag text 配对"机制驱动
 
 ### Tag 协议(已实现结构化版)
-任何归档(file / image / 公众号 DOCX / 长文本笔记 DOCX)落盘后,该用户在 `TAG_WINDOW_SECONDS`(默认 300 秒)内发的一条**含 type 关键词**的短文字,会被解析成 4 个字段(type / source / company / title),并以 `{date}_{type}_{company}[_{source}]_{title}.{ext}` 格式重命名该归档。
+任何归档(file / image / 公众号 DOCX / 长文本笔记 DOCX)落盘后,该用户在 `TAG_WINDOW_SECONDS`(默认 300 秒)内发的一条**含 type 关键词**的短文字,会被解析成 5 个字段(type / source / industry / company / title)+ date,并以 `{date}_{type}_{subject}[_{source}]_{title}.{ext}` 格式重命名该归档,其中 `subject = company or industry`。
 
 **解析规则**(`lib/tag_parser.py`):
 - **type**(必需,白名单 + 最长匹配 + 大小写不敏感):专家访谈 / 付费专家 / 公司交流 / 卖方汇报 / 媒体新闻 / Alpine周度汇报 / 同行交流 / 新闻 / 传闻 / Alpine
   - "Alpine周度汇报" 优先于 "Alpine",防止短前缀误吞
 - **source**(可选,白名单):专家网络(Acecamp / Thirdbridge / AlphaEngine / 公众号)+ 卖方(Citi / UBS / GS / MS / JPM / CICC / CLSA / Macquarie / Barclays / BofA / HSBC / Nomura / Jefferies / Deutsche / Bernstein / Daiwa)
   - 公众号抓取的 DOCX 默认带 `source_hint="公众号"`,用户 tag 没指定 source 时自动填上
-- **company**(必需,启发式):剩余 token 里第一个"像公司名"的——≥2 个汉字 或 ≥3 个全大写字母
+- **industry**(白名单,company 的"行业版"替代):AI / 互联网 / 电商 / 本地生活 / 招聘 / 半导体 / 新能源 / 创新药 / 银行 / 券商 / 快递 等约 30 项
+  - 用于资料对应行业而非特定公司的场景(如 "新闻 电商 行业增速放缓")
+  - 与 company 互不冲突,二者**至少一个**即可成立 tag
+- **company**(启发式):非白名单 token 里第一个"像公司名"的,优先级评分:
+  - ≥2 汉字 = 100(中文名)
+  - ≥3 字母含大写 = 50(Minimax / BABA / ByteDance)
+  - ≥3 字母全小写 = 10(minimax / deepseek)
+  - 同分取最早出现
 - **title**(可选):再剩余的 token 用 `_` 连接;为空则 fallback 到老文件名里的 auto_title(如公众号文章标题、笔记第一行),再 fallback 到 HHMMSS
+
+**subject 取舍规则**:
+- 有 company → subject = company
+- 无 company 有 industry → subject = industry(顶 company 槽位)
+- 二者都有 → subject = company,industry 自动 prepend 到 title 不丢信息
+
+**有效性校验**:type 必有 + (company OR industry) 至少一个。二者都没就拒绝。
 
 **示例**:
 
 | 原文件 | 用户 tag | 重命名后 |
 |---|---|---|
-| `20260516_143020.pdf` | `公司交流 阿里巴巴` | `20260516_公司交流_阿里巴巴_143020.pdf` |
-| `20260516_143020.pdf` | `卖方汇报 阿里 GS 创新药点评` | `20260516_卖方汇报_阿里_GS_创新药点评.pdf` |
-| `20260516_143020_阿里健康2HFY26_callback.docx`(公众号) | `新闻 阿里` | `20260516_新闻_阿里_公众号_阿里健康2HFY26_callback.docx` |
-| `20260516_143020.pdf` | `Alpine 阿里 Q1` | `20260516_Alpine_阿里_Q1.pdf` |
-| `20260516_143020.pdf` | `Alpine周度汇报 阿里 2026W20` | `20260516_Alpine周度汇报_阿里_2026W20.pdf` |
+| `2026-05-16_143020.pdf` | `公司交流 阿里巴巴` | `2026-05-16_公司交流_阿里巴巴_143020.pdf` |
+| `2026-05-16_143020.pdf` | `卖方汇报 阿里 GS 创新药点评` | `2026-05-16_卖方汇报_阿里_GS_创新药点评.pdf` |
+| `2026-05-16_143020.pdf` | `新闻 电商 行业增速放缓` | `2026-05-16_新闻_电商_行业增速放缓.pdf`(industry 占 subject) |
+| `2026-05-16_143020.pdf` | `新闻 AI OpenAI 新模型` | `2026-05-16_新闻_OpenAI_AI_新模型.pdf`(industry prepend 到 title) |
+| `2026-05-16_143020_阿里健康2HFY26_callback.docx` | `新闻 阿里` | `2026-05-16_新闻_阿里_公众号_阿里健康2HFY26_callback.docx` |
+| `2026-05-16_143020.pdf` | `Alpine周度汇报 阿里 2026W20` | `2026-05-16_Alpine周度汇报_阿里_2026W20.pdf` |
 
 **触发条件**:
 - 无 URL
@@ -245,7 +260,8 @@ dns:
 | 短文字(3..199 字符,无 pending) | text | 回执"文本消息" | ✅ |
 | 长文字(≥NOTE_MIN_LENGTH) | text | 落盘 DOCX + 登记 pending(等下一条 tag) | ✅ |
 | 含 URL(公众号) | text | Playwright 抓 → DOCX + 登记 pending | ✅ |
-| 含 URL(有道云 / 腾讯文档 / 网页) | text | 仅回执,待手动 | ✅(stub) |
+| 含 URL(普通财经新闻 / 博客)| text | Playwright + trafilatura 通用抽取 → DOCX | ✅ |
+| 含 URL(有道云 / 腾讯文档) | text | 仅回执,待手动(需登录态) | ✅(stub) |
 | 图片 | image | 解密 + 落盘 + 登记 pending | ✅ |
 | 文件(PDF / Word / 等) | file | 解密 + 落盘 + 登记 pending | ✅ |
 | 富 share 卡片(公众号 / 笔记 / 文档转发) | — | **平台拦截,根本到不了** | ❌(无解,需复制内容/链接) |
@@ -279,7 +295,8 @@ wechat-archiver/
 │   ├── aes.py                    # AES-256-CBC + 宽容 PKCS#7 unpad
 │   ├── filetype.py               # magic bytes → 扩展名
 │   ├── downloader.py             # download → decrypt → save 一站式
-│   ├── wechat_mp_fetcher.py      # Playwright 抓公众号 → DOCX
+│   ├── wechat_mp_fetcher.py      # Playwright 抓公众号 → DOCX(站点定制 selectors)
+│   ├── generic_web_fetcher.py    # Playwright + trafilatura 通用网页 → DOCX
 │   ├── text_note_saver.py        # 长文本 → DOCX
 │   ├── pending_tag.py            # userid → FIFO 队列,等待 tag 重命名
 │   └── tag_parser.py             # 白名单 + 启发式解析 tag → 结构化字段

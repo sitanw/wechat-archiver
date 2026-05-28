@@ -28,6 +28,7 @@ python main.py
 | 转发 PDF / Word / Excel / PPT | 解密 + 落到 `ARCHIVE_DIR` |
 | 转发图片 | 同上,识别成 .jpg/.png/.webp/.gif |
 | 转发公众号链接(**复制链接发,不要转发卡片**) | Playwright 抓正文 → DOCX 落盘 |
+| 转发**普通财经新闻链接**(华尔街见闻 / 36氪 / 财联社 / 雪球 / 虎嗅 / 新浪财经 等) | Playwright + trafilatura 通用抽取 → DOCX 落盘 |
 | 复制粘贴长篇笔记(≥200 字) | 落 DOCX,第一行做标题 |
 
 **重要**:**富 share 卡片(公众号卡片 / 笔记卡片 / 文档卡片)发不进来**——企微平台层挡掉了。要么复制链接发,要么复制全文发。
@@ -46,12 +47,24 @@ bot: ✅ 已重命名: 2026-05-16_公司交流_阿里巴巴_GS_Q1_callback.pdf
 
 **tag 字段顺序无所谓**,bot 自动识别:
 - **type**(必需,白名单 10 类):专家访谈 / 付费专家 / 公司交流 / 卖方汇报 / 媒体新闻 / Alpine周度汇报 / 同行交流 / 新闻 / 传闻 / Alpine
-- **source**(可选,白名单 18 个):Acecamp / Thirdbridge / AlphaEngine / 公众号 / Citi / UBS / GS / MS / JPM / CICC / CLSA / Macquarie / Barclays / BofA / HSBC / Nomura / Jefferies / Deutsche / Bernstein / Daiwa
-- **company**(必需):2+ 汉字(阿里巴巴) 或 3+ 全大写(BABA) 或 3+ 字母(minimax)
+- **source**(可选,白名单 19 个):Acecamp / Thirdbridge / AlphaEngine / 公众号 / Citi / UBS / GS / MS / JPM / CICC / CLSA / Macquarie / Barclays / BofA / HSBC / Nomura / Jefferies / Deutsche / Bernstein / Daiwa / 海豚研究
+- **company 或 industry**(**任一必需**)
+  - **company**:2+ 汉字(阿里巴巴) / 3+ 全大写(BABA) / 3+ 字母(minimax)
+  - **industry**(行业白名单约 30 项,适用于"对应行业而非特定公司"的资料):AI / 互联网 / 电商 / 本地生活 / 短视频 / 招聘 / 半导体 / 新能源 / 新能源车 / 光伏 / 创新药 / 医药 / 银行 / 券商 / 快递 / 物流 / 等
 - **date**(可选):`2026-05-07` / `2026/05/07` / `20260507` 任一格式;不打则用文件实际日期
 - **title**(可选):其他自由词;不打则用原文件名
 
-最终文件名:`{date}_{type}_{company}[_{source}]_{title}.{ext}`
+最终文件名:`{date}_{type}_{subject}[_{source}]_{title}.{ext}`
+- subject = company 优先;无 company 时 industry 占位
+- 若 company 和 industry 都给了:company 占 subject,industry 自动 prepend 到 title 不丢失
+
+例子:
+
+| tag 文字 | 落盘文件名 |
+|---|---|
+| `公司交流 阿里巴巴 GS Q1 callback` | `2026-05-16_公司交流_阿里巴巴_GS_Q1_callback.pdf` |
+| `新闻 电商 行业增速放缓` | `2026-05-16_新闻_电商_行业增速放缓.pdf` |
+| `新闻 AI OpenAI 新模型发布` | `2026-05-16_新闻_OpenAI_AI_新模型发布.pdf` |
 
 ### 3. 多文件按顺序排队(FIFO)
 

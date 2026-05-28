@@ -1,12 +1,13 @@
 """
 文本消息 handler。
 
-text msgtype 实际承载了三类内容,按优先级分流:
-  1. **Tag 文字**(用户刚保存完文件,这条短文字给文件打 type/company/source/title)
-     - 触发:无 URL + 文本含 type 白名单关键词 + 长度 [3, NOTE_MIN_LENGTH-1)
-     - 动作:parse_tag → 用最老的 pending 重命名文件,然后 consume
-  2. 链接分享(URL 出现在 content 里,公众号走抓取,其他类型回执 stub)
-  3. 纯文本(无 URL 也非 tag):长则落盘成 DOCX 笔记,短则只回执
+text msgtype 实际承载了多类内容,按优先级分流:
+  1. **引用模式 Tag**(用户引用 bot 之前的回执 + 加 tag → 直接重命名那个文件)
+  2. **首行 tag + body 笔记**(多行文本,首行含 type 关键词 → 把 body 落成 DOCX
+     并用首行的 tag 字段命名;不消费 pending,因为 body 是新内容)
+  3. **常规 Tag 文字**(短文本含 type 关键词 + 有 pending → 给最老的 pending 重命名)
+  4. **链接分享**(URL 出现在 content 里,公众号 / 通用网页走抓取,其他类型回执 stub)
+  5. **长文本笔记**(无 URL 也无 tag 信号:长则落盘成 DOCX 笔记,短则只回执)
 """
 from __future__ import annotations
 
@@ -49,6 +50,18 @@ _TAG_MIN_CHARS = 3
 _QUOTE_TAG_MIN_CHARS = 2
 
 
+def _split_first_line_body(text: str) -> tuple[str, str]:
+    """
+    把多行文本切成 (首行, 正文)。
+    单行(无 \\n)返回 (text, "");首行 / 正文都做 strip。
+    用于"首行 tag + 正文"分支判定:首行像 tag、剩余是 body 就触发"已标 tag 笔记"流程。
+    """
+    parts = text.split("\n", 1)
+    first = parts[0].strip()
+    body = parts[1].strip() if len(parts) > 1 else ""
+    return first, body
+
+
 # 非公众号 URL 的"下一步"提示,纯展示用
 _NEXT_STEP_HINT = {
     "youdao_note":   "(暂仅记录链接,需手动保存到 ARCHIVE_DIR)",
@@ -85,6 +98,14 @@ async def handle(body: dict) -> None:
             if handled:
                 return
             # 没抠到目标 / 没显式字段 → fall through 走常规 tag / 文本消息
+
+        # 3a.5. 首行 tag + body 笔记:多行文本 + 首行含 type 关键词 → 把 body 落成
+        # DOCX,用首行的 tag 字段命名;不消费 pending(body 是新内容)。
+        # 长度无关:显式 type 关键词优先于长度阈值。
+        first_line, body_text = _split_first_line_body(text)
+        if body_text and has_type_keyword(first_line):
+            await _handle_tagged_note(body, first_line, body_text)
+            return
 
         # 3b. 常规 Tag 配对:含 type 关键词 + 长度合理
         if has_type_keyword(text) and _TAG_MIN_CHARS <= len(text) < get_min_length():
@@ -509,7 +530,100 @@ async def _handle_generic_web(body: dict, url: str, user_title_hint: str | None,
 
 
 # ────────────────────────────────────────────────────────────
-#  长文本笔记落盘
+#  首行 tag + body 笔记
+# ────────────────────────────────────────────────────────────
+async def _handle_tagged_note(body: dict, first_line: str, body_text: str) -> None:
+    """
+    多行文本,首行含 type 关键词:把 body 落成 DOCX,用首行 tag 字段命名。
+
+    流程:
+      1. save_as_docx 把 body 存成 {date}_{time}[_{auto_title}].docx
+      2. parse_tag(first_line) → 解析 tag 字段
+      3. tag 合法(type + company/industry):rename 成结构化文件名,**不登记 pending**
+      4. tag 不合法(缺 company/industry):保留 timestamp 文件名 + 登记 pending,
+         提示用户在窗口内补 tag 或引用回执补字段
+    """
+    print(f"[text handler / tagged-note] 首行 type 命中,正文 {len(body_text)} 字符,落盘 ...")
+    try:
+        path, size, _auto_title = save_as_docx(body_text, body)
+    except Exception as e:
+        print(f"[text handler / tagged-note] 落盘失败: {type(e).__name__}: {e}")
+        await reply_markdown(body, f"❌ 文本落盘失败\n\n`{type(e).__name__}: {e}`")
+        return
+
+    parsed = parse_tag(first_line)
+    userid = (body.get("from") or {}).get("userid", "")
+    window_min = get_window_seconds() // 60
+
+    if is_valid_tag(parsed):
+        # tag 完整 → 直接 rename 到结构化文件名,不登记 pending
+        new_name = build_renamed_filename(path, parsed, source_hint=None)
+        new_path = path.with_name(new_name)
+        if new_path.exists() and new_path != path:
+            stem = new_path.stem
+            for i in range(1, 100):
+                cand = new_path.with_name(f"{stem}_{i}{new_path.suffix}")
+                if not cand.exists():
+                    new_path = cand
+                    break
+        if new_path != path:
+            try:
+                path.rename(new_path)
+                path = new_path
+            except OSError as e:
+                await reply_markdown(
+                    body,
+                    f"❌ tag 重命名失败(笔记已存)\n\n"
+                    f"`{type(e).__name__}: {e}`\n\n文件: `{path.name}`",
+                )
+                return
+
+        print(f"[tagged-note] 已保存 {path.name} ({size} bytes),tag 直接命名,无 pending")
+        reply_lines = [
+            f"✅ 已保存 **笔记**({len(body_text)} 字)并按 tag 命名",
+            f"文件: `{path.name}`",
+        ]
+        parts = [f"type={parsed['type']}"]
+        if parsed.get("company"):
+            parts.append(f"company={parsed['company']}")
+        if parsed.get("industry"):
+            parts.append(f"industry={parsed['industry']}")
+        if parsed.get("source"):
+            parts.append(f"source={parsed['source']}")
+        if parsed.get("date"):
+            parts.append(f"date={parsed['date']}")
+        if parsed.get("title"):
+            parts.append(f"title={parsed['title']}")
+        reply_lines.append("解析: " + ", ".join(parts))
+        await reply_markdown(body, "\n\n".join(reply_lines))
+        return
+
+    # tag 不完整 → 文件用 timestamp 命名,登记 pending,提示用户补字段
+    register_pending(userid, path)
+    missing = []
+    if not parsed.get("type"):
+        # 理论上不会触发(has_type_keyword 已守门),留作安全网
+        missing.append(f"**type**(从: {', '.join(TYPE_WHITELIST[:5])} 等)")
+    if not parsed.get("company") and not parsed.get("industry"):
+        missing.append(
+            "**company 或 industry 任一**\n"
+            "  • company:≥2 汉字(如 阿里巴巴) / ≥3 字母(如 Minimax、BABA)\n"
+            f"  • industry:行业白名单({len(INDUSTRY_WHITELIST)} 项,如 AI / 电商 / 新能源 等)"
+        )
+
+    print(f"[tagged-note] 已保存 {path.name},tag 不全,登记 pending 等补字段")
+    await reply_markdown(
+        body,
+        f"✅ 已保存 **笔记**({len(body_text)} 字)但首行 tag 不完整,文件用 timestamp 命名\n\n"
+        f"首行: `{first_line}`\n\n"
+        f"文件: `{path.name}`\n\n"
+        f"缺: {' / '.join(missing)}\n\n"
+        f"💡 {window_min} 分钟内可:**发完整 tag** 重命名,或 **引用本条回执** + 补字段",
+    )
+
+
+# ────────────────────────────────────────────────────────────
+#  长文本笔记落盘(无 tag 信号兜底)
 # ────────────────────────────────────────────────────────────
 async def _handle_long_text_note(body: dict, content: str) -> None:
     """长文本(笔记 / 调研纪要类) → 落盘 DOCX 到 ARCHIVE_DIR"""

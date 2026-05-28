@@ -233,6 +233,47 @@ dns:
 - 持久化 pending(sqlite),避免进程重启丢失
 - 引用 URL 消息 → 通过 URL 反查文件(需建持久 `URL → file_path` 映射)
 
+### 首行 tag + body 笔记(Phase 4,已实现)
+**问题**:user 复制粘贴一段纪要 / 笔记进来,期望"打 tag + 存内容"一步完成,而不是"先发,等 bot 回执,再追 tag"那个 5 分钟竞速窗口。同时,**显式 type 关键词**比单纯"≥200 字"更稳健地区分笔记 vs 闲聊。
+
+**触发条件**(`handlers/text.py::handle` 第 3a.5 分支,排在引用模式之后,常规 tag 之前):
+- 无 URL,无 quote(否则前序分支接管)
+- `_split_first_line_body(text)`:把文本按第一个 `\n` 切两段。首行 strip 后非空,body strip 后非空
+- 首行 `has_type_keyword`:命中 type 白名单(子串扫描)
+
+**触发后流程**(`_handle_tagged_note`):
+1. `save_as_docx(body, msgbody)` 把 body 落到 ARCHIVE_DIR,**filename = `{date}_{time}[_first_line_of_body].docx`**(沿用 long-text-note 的命名)
+2. `parse_tag(first_line)` → 解析 tag 字段
+3. **tag 合法**(type + company/industry):`build_renamed_filename` 重命名为结构化文件名 → **不登记 pending**(文件已结构化,无需 tag 窗口)
+4. **tag 不全**(缺 company/industry):**保留 timestamp 文件名 + 登记 pending**,提示用户:
+   - 5 分钟内发完整 tag → FIFO 消费(可能消费到其他更老的 pending,不一定准)
+   - 引用本条回执 + 补字段(精准定位本笔记)
+
+**设计决策**:
+- **首行专属**:正文里出现"新闻"两字不被当 type(避免 body 被吞)。`has_type_keyword` 只跑在 `first_line` 上
+- **长度无关**:正文 30 字也能存。NOTE_MIN_LENGTH(200)只作为**无 tag 散文**的兜底阈值;有 tag 信号时 user 已显式表达"我要存这段",不再用长度过滤
+- **不消费 pending**:body 是 user 当下创作的新内容,与队列里的旧文件(可能 5 分钟前发的 PDF)语义无关。要 tag pending 仍走"发短 tag"或"引用 bot 回执"
+- **invalid tag 仍落盘**:`is_valid_tag` 失败时不丢弃 body,而是用 timestamp 命名 + 登记 pending,user 可以引用回执补字段。理由:笔记内容比命名重要,绝不丢内容
+
+**与现有分支的优先级**:
+| 顺序 | 分支 | 触发条件 |
+|---|---|---|
+| 3a | 引用模式 | 有 quote + 显式 tag 字段 |
+| **3a.5** | **首行 tag + body**(新) | **多行 + 首行 has_type_keyword** |
+| 3b | 常规 tag | has_type_keyword + 3 ≤ len < NOTE_MIN_LENGTH |
+| 3c | 长文本笔记 | len ≥ NOTE_MIN_LENGTH |
+| 3d | 短文本回执 | 其他 |
+
+**示例**:
+
+| 输入 | 落盘文件名 | pending? |
+|---|---|---|
+| `新闻 阿里 Q1\n今天阿里发布了Q1业绩...` | `2026-05-27_新闻_阿里_Q1.docx` | ❌ |
+| `专家访谈 minimax Acecamp\n[2000 字访谈纪要]` | `2026-05-27_专家访谈_minimax_Acecamp.docx` | ❌ |
+| `新闻 电商\n[正文]` | `2026-05-27_新闻_电商.docx`(industry 占 subject) | ❌ |
+| `新闻\n[正文]`(缺 company/industry) | `2026-05-27_HHMMSS_<auto_title>.docx` | ✅ 待补 |
+| `新闻 阿里 Q1`(单行,无正文) | 不触发本分支,走 3b 常规 tag | — |
+
 ### NOTE_MIN_LENGTH 与 TAG_MIN_CHARS 的阈值关系
 - 文本长度 < 3:回执"已识别为 文本消息",忽略(避免"ok"被误判为 tag)
 - 3 ≤ 长度 < NOTE_MIN_LENGTH(默认 200) **且有 pending**:走 tag 重命名
@@ -258,7 +299,8 @@ dns:
 | 短文字(3..199 字符,**有 pending 归档**) | text | **作为 tag 重命名 pending 文件** | ✅ |
 | 短文字 + **引用 bot 回执** | text + quote | **引用模式:从 quote 抠出文件名直接 rename**(不消费 pending) | ✅ |
 | 短文字(3..199 字符,无 pending) | text | 回执"文本消息" | ✅ |
-| 长文字(≥NOTE_MIN_LENGTH) | text | 落盘 DOCX + 登记 pending(等下一条 tag) | ✅ |
+| **多行文本,首行含 type 关键词 + 正文** | text | **落 DOCX,首行 tag 直接结构化命名,不消费 pending** | ✅ |
+| 长文字(≥NOTE_MIN_LENGTH,无 tag 信号) | text | 落盘 DOCX + 登记 pending(等下一条 tag) | ✅ |
 | 含 URL(公众号) | text | Playwright 抓 → DOCX + 登记 pending | ✅ |
 | 含 URL(普通财经新闻 / 博客)| text | Playwright + trafilatura 通用抽取 → DOCX | ✅ |
 | 含 URL(有道云 / 腾讯文档) | text | 仅回执,待手动(需登录态) | ✅(stub) |

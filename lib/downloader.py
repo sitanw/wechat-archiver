@@ -34,9 +34,15 @@ DEFAULT_TIMEOUT = 60
 
 
 def get_archive_dir() -> Path:
-    """优先 .env 的 ARCHIVE_DIR,缺省 fallback 到项目根下的 inbox/"""
+    """
+    优先 .env 的 ARCHIVE_DIR,缺省 fallback 到项目根下的 inbox/。
+    expandvars 展开 Windows 环境变量(如 %OneDrive%),目录不存在自动创建。
+    """
     env_val = os.getenv("ARCHIVE_DIR", "").strip()
-    return Path(env_val) if env_val else _DEFAULT_INBOX
+    expanded = os.path.expandvars(env_val) if env_val else ""
+    path = Path(expanded) if expanded else _DEFAULT_INBOX
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 # ───────────────────────────────────────────────

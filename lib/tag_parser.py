@@ -48,6 +48,7 @@ SOURCE_WHITELIST: list[str] = [
     "Citi", "UBS", "GS", "MS", "JPM", "CICC", "CLSA",
     "Macquarie", "Barclays", "BofA", "HSBC", "Nomura",
     "Jefferies", "Deutsche", "Bernstein", "Daiwa",
+    "SemiAnalysis",
     "海豚研究",
 ]
 
